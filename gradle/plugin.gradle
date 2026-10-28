@@ -1,0 +1,37 @@
+// Shared, copied into each independent repository; no parent checkout is required.
+apply plugin: 'java'
+apply plugin: 'xyz.jpenilla.run-paper'
+group = 'club.swustmc'
+def product = project.findProperty('productName') ?: project.name
+def mc = project.minecraftVersion.toString()
+base { archivesName = "${product}-mc${mc}-plugin" }
+repositories {
+    mavenCentral()
+    maven { url = 'https://repo.papermc.io/repository/maven-public/' }
+}
+if (product != 'yudream-minecraft-server') {
+    dependencies { compileOnly "dev.folia:folia-api:${foliaApiVersion}" }
+}
+java { withSourcesJar() }
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = product == 'yudream-minecraft-server' ? 8 : 25
+}
+tasks.withType(AbstractArchiveTask).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+tasks.named('processResources') {
+    inputs.property('version', providers.provider { project.version })
+    filesMatching(['paper-plugin.yml', 'plugin.yml']) { expand(version: project.version.toString()) }
+}
+tasks.register('archiveArtifact', Copy) {
+    dependsOn 'jar', 'check'
+    from tasks.named('jar')
+    into rootProject.file("release/${product}")
+}
+tasks.named('build') { dependsOn 'archiveArtifact' }
+runPaper {
+    folia { registerTask { minecraftVersion(mc); runDirectory(rootProject.file('run')) } }
+}
+tasks.named('runServer') { dependsOn 'runFolia'; onlyIf { false } }

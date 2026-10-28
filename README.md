@@ -1,0 +1,74 @@
+# yudream-minecraft-server
+
+[![Build](https://github.com/SWUST-Minecraft-Club/yudream-minecraft-server/actions/workflows/build.yml/badge.svg)](https://github.com/SWUST-Minecraft-Club/yudream-minecraft-server/actions/workflows/build.yml)
+
+作者：**SWUSTMC Club** · 当前版本：`2.1.1-beta.1`。
+
+本仓为独立主仓。Java 25 下运行 `./gradlew build`；不需要检出 mcPlugin 或相邻插件仓库。预发布标签为 `v2.1.1-beta.1`，CI 检查版本、ChangeLog 和本地编译依赖哈希。
+
+[来源与历史](MIGRATION-SOURCE.md) · [依赖锁](dependencies.lock.json) · [版本规范](docs/dev/版本与产物规范.md) · [变更记录](CHANGELOG.md)
+
+---
+
+# yudream-minecraft-server（本地改造版）
+
+把本服玩家动态（进服 / 退服 / AFK / 聊天 / 死亡 / 成就）上报给 YuDream Admin 的 **Bukkit 桥接插件**，
+可独立运行（`standalone`），也可作为代理后端传感器（`downstream`）。
+
+源码基线是官方 `1.6.2` 产物的**反编译代码**，原有功能与兼容分支保持不变；本仓版本在其上做了两处**加法**：
+
+| 新增 | 说明 |
+| --- | --- |
+| 本地在线时长统计 | 口径与后端逐条对齐（在线时长 = 已结算区间 + 当前未结算区间；AFK 单独累计，不从在线时长里扣）；后端不可用、还没配好时都照常记账。落盘在 `plugins/YudreamMinecraftServer/playtime.yml` |
+| 待发上报落盘 | 进服 / 退服 / AFK 起止先写本地日志（`pending-reports.jsonl`），后端恢复后按**原始时间戳**按序补发；进程重启也不丢。因为后端按 `eventAt` 结算且 join / quit / AFK 幂等，补发不会重复计时 |
+| 与后端对齐 | 定期把后端的每玩家累计拉下来合并（`local-playtime.sync-from-backend`）：本地只从插件开始记账那一刻算起，后端可能有更早的历史，不对齐两边会差一个历史量。已结算累计取两边较大值，当前区间只认"玩家确实在线"的那一侧，所以只补历史、不会把离线时间算成在线 |
+
+数据流向：**事件 → 本地台账（立即）→ 待发日志（落盘）→ 后端（可达时）** + **后端 → 本地台账（定期对齐）**。
+所以「后端挂了」不会影响本地数字，后端恢复后两边的数字会自动收敛到同一个值。
+
+## 构建
+
+```bash
+./gradlew build
+# 产物：./build/libs/yudream-minecraft-server-bukkit-Beta_2_1_0.jar
+```
+
+- 面向 1.8.8+ 的 Bukkit 系服务端（`plugin.yml` 声明 `api-version: 1.13`），因此**编译目标是
+  spigot-api 1.13.2、字节码 Java 8**，而不是本仓其它插件的 Folia 26.3 + Java 25
+  （在它自己的 `build.gradle` 里用 `ext.bringsOwnBukkitApi = true` 跳过根工程的默认依赖）。
+- Folia 26.3 兼容：`plugin.yml` 声明 `folia-supported: true`，运行期由反射式 `FoliaSchedulerCompat`
+  识别服务端并使用全局 / 异步 / 实体调度器；非 Folia 服务端自动回退到 Bukkit 调度器，
+  所以同一份 jar 仍可继续跑 1.8.8+。
+- 产物命名沿用产品线 `yudream-minecraft-server-bukkit-<版本>.jar`（跨游戏版本，不带 mc 标签），
+  这条是《版本与产物规范》里登记的例外。
+
+## 新增配置
+
+```yaml
+local-playtime:
+  enabled: true
+  save-interval-seconds: 30     # 落盘间隔；停服与命令查询时也会立即落盘
+  sync-from-backend: true       # 定期拉后端的每玩家累计，补齐本地台账缺的历史
+  sync-interval-seconds: 300    # 对齐间隔
+
+durable-queue:
+  enabled: true
+  max-pending: 5000             # 待发事件上限，超出丢最老的并告警
+```
+
+> 对齐（以及 `/yudreammc status` 的远端统计）走的是**管理端**列表接口 `/admin/servers/{id}/players`，
+> 需要 API key 带 `plugin:minecraft-server:manage` 权限；没有该权限时对齐会打一行警告并跳过，本地统计不受影响。
+> 下游（代理）模式不做对齐 —— 那种部署下凭证在代理侧，本机拿不到列表。
+
+## 面包屑
+
+- 本地台账文件格式与服务端之间是**稳定接口**：伴侣插件
+  [`https://github.com/SWUST-Minecraft-Club/YudreamPlaytime/tree/main/`](https://github.com/SWUST-Minecraft-Club/YudreamPlaytime/blob/main/.) 直接读 `playtime.yml`，改格式要同步那一侧。
+- 命令：`/yudreammc playtime [玩家]` 看本地在线 / AFK 时长；`/yudreammc syncplaytime` 立即与后端对齐一次
+  （结果直接回在聊天框，不用翻日志）；`/yudreammc status` 会显示插件版本、本地统计开关、对齐间隔与最近一次对齐结果。
+- 排查口诀：菜单数字补不上后端的历史 → 先看 `/yudreammc syncplaytime` 的回执。若提示 HTTP 403/401，
+  说明该 API key 没有 `plugin:minecraft-server:manage` 权限（列表接口在管理端路径下）。
+- 反编译基线里 `online.yudream.minecraft.bridge.core` 包是产物自带的一份共享核心副本（部分类仍在用），
+  其中两处无法编译的地方做了最小修正：`JsonValue.writeTo` 的重复局部变量名、`BridgeProtocol.decode`
+  默认分支引用了不存在的变量；另外 `YudreamCommand` 里一处 `final` 局部变量在分支与 catch 里重复赋值。
+  这三处都只影响编译，不改变行为。
